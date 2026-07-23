@@ -1,4 +1,4 @@
-name: Windows11RSP
+name: Windows-RDP-Tailscale
 
 on:
   workflow_dispatch:
@@ -6,123 +6,123 @@ on:
 jobs:
   rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
 
     steps:
-      # ------------------------
-      # Enable Remote Desktop
-      # ------------------------
-      - name: Enable RDP + Firewall Rules
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-              -Name "fDenyTSConnections" -Value 0 -Force
-          
-          # Disable NLA (optional but required for easier RDP)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-              -Name "UserAuthentication" -Value 0 -Force
 
-          # Allow RDP port
-          netsh advfirewall firewall delete rule name="RDP-Allow" > $null 2>&1
-          netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389
+    - name: Enable RDP
+      shell: pwsh
+      run: |
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0
 
-          Restart-Service -Name TermService -Force
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-      # ------------------------
-      # Create Local RDP User
-      # ------------------------
-      - name: Create RDP User
-        run: |
-          Add-Type -AssemblyName System.Security
-          $u = 4; $l = 4; $n = 4; $s = 4
+        Restart-Service TermService -Force
 
-          $charSet = @{
-            Upper   = [char[]](65..90)
-            Lower   = [char[]](97..122)
-            Number  = [char[]](48..57)
-            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-          }
+    - name: Create RDP User
+      shell: pwsh
+      run: |
 
-          $raw = @()
-          $raw += $charSet.Upper   | Get-Random -Count $u
-          $raw += $charSet.Lower   | Get-Random -Count $l
-          $raw += $charSet.Number  | Get-Random -Count $n
-          $raw += $charSet.Special | Get-Random -Count $s
+        $username = "RDP"
 
-          $password = -join ($raw | Sort-Object { Get-Random })
-          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+        if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name $username
+        }
 
-          New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+        $chars = 33..126
+        $password = -join ($chars | Get-Random -Count 16 | ForEach-Object { [char]$_ })
 
-          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+        $secure = ConvertTo-SecureString $password -AsPlainText -Force
 
-      # ------------------------
-      # Install Tailscale
-      # ------------------------
-      - name: Install Tailscale
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installer = "$env:TEMP\tailscale.msi"
+        New-LocalUser `
+            -Name $username `
+            -Password $secure `
+            -AccountNeverExpires
 
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installer
+        Add-LocalGroupMember -Group "Administrators" -Member $username
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
 
-          Start-Process msiexec.exe `
-            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+        "RDP_USER=$username" >> $env:GITHUB_ENV
+        "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+    - name: Install Tailscale
+      shell: pwsh
+      run: |
+
+        $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+        $msi = "$env:TEMP\tailscale.msi"
+
+        Invoke-WebRequest $url -OutFile $msi
+
+        Start-Process msiexec.exe `
+            -ArgumentList "/i `"$msi`" /quiet /norestart" `
             -Wait
 
-          Remove-Item $installer -Force
+    - name: Connect Tailscale
+      shell: pwsh
+      run: |
 
-      # ------------------------
-      # Connect to Tailscale
-      # ------------------------
-      - name: Connect Tailscale
-        run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-            --hostname=gh-win11-${env:GITHUB_RUN_ID}
+        $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          $tsIP = ""
-          for ($i=0; $i -lt 10; $i++) {
-            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-            if ($tsIP) { break }
-            Start-Sleep 5
-          }
+        & $ts up `
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
+            --hostname="github-rdp-${{ github.run_id }}"
 
-          if (-not $tsIP) {
-            Write-Error "Tailscale failed to obtain an IP."
-            exit 1
-          }
+        Start-Sleep 10
 
-          echo "TS_IP=$tsIP" >> $env:GITHUB_ENV
+        $ip = (& $ts ip -4)[0]
 
-      # ------------------------
-      # Connectivity Test
-      # ------------------------
-      - name: Test RDP Port
-        run: |
-          $result = Test-NetConnection -ComputerName $env:TS_IP -Port 3389
-          if (-not $result.TcpTestSucceeded) {
-            Write-Error "Port 3389 is NOT accessible."
-            exit 1
-          }
-          Write-Host "RDP port is open!"
+        if (!$ip) {
+            throw "Failed to obtain Tailscale IP."
+        }
 
-      # ------------------------
-      # Final Output + Keep Alive
-      # ------------------------
-      - name: Keep Runner Alive
-        run: |
-          Write-Host "=============================="
-          Write-Host "     WINDOWS 11 RDP ACTIVE    "
-          Write-Host "=============================="
-          Write-Host "Connect Using:"
-          Write-Host "Tailscale IP : $env:TS_IP"
-          Write-Host "Username     : RDP"
-          Write-Host "Password     : $env:RDP_PASS"
-          Write-Host "=============================="
+        "TS_IP=$ip" >> $env:GITHUB_ENV
 
-          while ($true) {
+    - name: Verify RDP
+      shell: pwsh
+      run: |
+
+        $result = Test-NetConnection -ComputerName $env:TS_IP -Port 3389
+
+        if (!$result.TcpTestSucceeded) {
+            throw "RDP Port 3389 is closed."
+        }
+
+        Write-Host "RDP Port Open."
+
+    - name: Connection Details
+      shell: pwsh
+      run: |
+
+        @"
+# Windows RDP Ready
+
+## Connection
+
+**IP**
+$env:TS_IP
+
+**Username**
+$env:RDP_USER
+
+**Password**
+$env:RDP_PASS
+
+"@ >> $env:GITHUB_STEP_SUMMARY
+
+        Write-Host "================================="
+        Write-Host "Windows RDP Ready"
+        Write-Host "================================="
+        Write-Host "IP       : $env:TS_IP"
+        Write-Host "Username : $env:RDP_USER"
+        Write-Host "Password : $env:RDP_PASS"
+        Write-Host "================================="
+
+    - name: Keep Alive
+      shell: pwsh
+      run: |
+
+        while ($true) {
             Write-Host "[KEEP-ALIVE] $(Get-Date)"
             Start-Sleep -Seconds 300
-          }
+        }
